@@ -24,6 +24,11 @@ import joblib
 from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support, confusion_matrix
 
 from src.models.network import NIDSNeuralNet
+from src.data.preprocess import NIDSPreprocessor
+
+# Make NIDSPreprocessor accessible in __main__ namespace for joblib unpickling compatibility
+import __main__
+__main__.NIDSPreprocessor = NIDSPreprocessor
 
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
