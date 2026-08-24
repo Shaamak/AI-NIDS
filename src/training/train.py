@@ -1,9 +1,12 @@
 """
-Phase 6: PyTorch Training Pipeline
-----------------------------------
-This script is the "engine" that trains our Deep Learning model.
-It handles DataLoaders, the Forward Pass, the Backward Pass (Backpropagation),
-and Model Checkpointing.
+Phase 6 (v2): Advanced PyTorch Training Pipeline
+-------------------------------------------------
+UPGRADES from v1:
+  1. Class-Weighted Loss: Penalizes the model more for missing rare attack classes.
+  2. Learning Rate Scheduler (ReduceLROnPlateau): Auto-reduces LR when loss stalls.
+  3. Early Stopping: Stops training if validation loss hasn't improved in N epochs.
+  4. Larger batch size (256) for more stable gradient estimates with BatchNorm.
+  5. More epochs (50) with early stopping safety net.
 """
 
 import os
@@ -19,13 +22,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from collections import Counter
 import numpy as np
 
-# Import our custom classes from Phase 5
 from src.models.network import NIDSDataset, NIDSNeuralNet
 
-PROCESSED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "processed")
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
+PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
 def load_data():
     data_path = os.path.join(PROCESSED_DIR, "processed_data.npz")
@@ -35,76 +38,125 @@ def load_data():
     data = np.load(data_path)
     return data['X_train'], data['y_train'], data['X_test'], data['y_test']
 
+def compute_class_weights(y_train, num_classes, device):
+    """
+    WHAT THIS DOES:
+    Calculates inverse-frequency weights for each class.
+    
+    WHY WE NEED IT:
+    Our dataset is extremely imbalanced:
+      - "Normal" traffic:  ~37,000 samples
+      - "Worms" attack:    ~44 samples (840x fewer!)
+    
+    Without class weights, the model learns to always predict "Normal" because
+    that minimizes overall loss. With class weights, we tell PyTorch:
+    "Getting a Worm wrong is 840x more costly than getting Normal wrong."
+    
+    FORMULA: weight_i = total_samples / (num_classes * count_of_class_i)
+    """
+    class_counts = Counter(y_train)
+    total = len(y_train)
+    weights = []
+    for i in range(num_classes):
+        count = class_counts.get(i, 1)
+        w = total / (num_classes * count)
+        weights.append(w)
+    
+    weights_tensor = torch.tensor(weights, dtype=torch.float32).to(device)
+    print(f"[INFO] Class weights: {[f'{w:.2f}' for w in weights]}")
+    return weights_tensor
+
 def train_model():
-    print("[INFO] Loading preprocessed data...")
+    print("=" * 60)
+    print("  AI-NIDS Advanced Training Pipeline v2")
+    print("=" * 60)
+    
+    print("\n[INFO] Loading preprocessed data...")
     X_train, y_train, X_test, y_test = load_data()
 
     input_dim = X_train.shape[1]
     num_classes = len(np.unique(y_train))
     print(f"[INFO] Features: {input_dim}, Classes: {num_classes}")
+    print(f"[INFO] Train samples: {len(X_train):,}, Test samples: {len(X_test):,}")
 
     # 1. DATASETS & DATALOADERS
-    # We wrap our Numpy arrays in PyTorch Datasets
     train_dataset = NIDSDataset(X_train, y_train)
     test_dataset = NIDSDataset(X_test, y_test)
 
-    # DataLoader handles shuffling and grouping into batches (e.g., 64 rows at a time)
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    # Larger batch size (256) works better with BatchNorm because 
+    # the batch statistics (mean/variance) are more representative.
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
-    # 2. DEVICE & MODEL INITIALIZATION
-    # This makes the code device-independent (runs on GPU if available, else CPU)
+    # 2. DEVICE & MODEL
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Training on device: {device}")
 
     model = NIDSNeuralNet(input_dim=input_dim, num_classes=num_classes).to(device)
-
-    # 3. LOSS FUNCTION & OPTIMIZER
-    # CrossEntropyLoss automatically applies Softmax and calculates how wrong our predictions are
-    criterion = nn.CrossEntropyLoss()
     
-    # Adam is our optimizer. It updates the network weights to minimize the loss.
-    # lr=0.001 is the "learning rate" (how big of a step it takes when adjusting weights)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Print model parameter count
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[INFO] Model parameters: {total_params:,} total, {trainable_params:,} trainable")
 
-    # 4. TRAINING LOOP
-    epochs = 20
+    # 3. CLASS-WEIGHTED LOSS FUNCTION
+    # This is the single biggest accuracy booster for imbalanced datasets.
+    class_weights = compute_class_weights(y_train, num_classes, device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    # 4. OPTIMIZER WITH WEIGHT DECAY (L2 Regularization)
+    # weight_decay adds a penalty for large weights, preventing overfitting.
+    # It is equivalent to L2 regularization: Loss = CE_Loss + lambda * ||W||^2
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+
+    # 5. LEARNING RATE SCHEDULER
+    # ReduceLROnPlateau watches the validation loss.
+    # If it hasn't improved for 'patience' epochs, it reduces lr by factor 0.5.
+    # This lets the model make big jumps early and fine-tune later.
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
+
+    # 6. TRAINING LOOP WITH EARLY STOPPING
+    epochs = 50
     best_val_loss = float('inf')
+    patience = 7         # Stop if no improvement for 7 consecutive epochs
+    patience_counter = 0
     model_save_path = os.path.join(MODELS_DIR, "nids_model.pt")
     config_save_path = os.path.join(MODELS_DIR, "model_config.json")
 
-    print("\nStarting Training...\n")
+    print(f"\n{'='*60}")
+    print(f"  Starting Training: {epochs} epochs, batch_size=256")
+    print(f"  Early stopping patience: {patience}")
+    print(f"{'='*60}\n")
+
     for epoch in range(epochs):
-        # Put model in "Training Mode" (Enables Dropout)
+        # ---- TRAINING PHASE ----
         model.train()
         train_loss = 0.0
+        train_correct = 0
+        train_total = 0
 
         for batch_X, batch_y in train_loader:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
-            # --- THE MAGIC 3 STEPS OF BACKPROPAGATION ---
-            
-            # Step 1: Zero out old gradients (flush the memory)
             optimizer.zero_grad()
-            
-            # Step 2: Forward Pass (Make predictions)
             predictions = model(batch_X)
             loss = criterion(predictions, batch_y)
-            
-            # Step 3: Backward Pass & Step (Calculate errors & update weights)
             loss.backward()
             optimizer.step()
 
             train_loss += loss.item()
+            _, predicted = torch.max(predictions.data, 1)
+            train_total += batch_y.size(0)
+            train_correct += (predicted == batch_y).sum().item()
 
-        # 5. VALIDATION LOOP
-        # Put model in "Evaluation Mode" (Disables Dropout for fair testing)
+        # ---- VALIDATION PHASE ----
         model.eval()
         val_loss = 0.0
-        correct = 0
-        total = 0
+        val_correct = 0
+        val_total = 0
 
-        # torch.no_grad() tells PyTorch to stop tracking gradients to save memory
         with torch.no_grad():
             for batch_X, batch_y in test_loader:
                 batch_X, batch_y = batch_X.to(device), batch_y.to(device)
@@ -113,27 +165,44 @@ def train_model():
                 loss = criterion(predictions, batch_y)
                 val_loss += loss.item()
 
-                # Get the predicted class (the index with the highest score)
                 _, predicted = torch.max(predictions.data, 1)
-                total += batch_y.size(0)
-                correct += (predicted == batch_y).sum().item()
+                val_total += batch_y.size(0)
+                val_correct += (predicted == batch_y).sum().item()
 
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(test_loader)
-        val_accuracy = 100 * correct / total
+        train_accuracy = 100 * train_correct / train_total
+        val_accuracy = 100 * val_correct / val_total
+        current_lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
+        print(f"Epoch [{epoch+1:02d}/{epochs}] | "
+              f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}% | "
+              f"Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | "
+              f"LR: {current_lr:.6f}")
 
-        # 6. MODEL CHECKPOINTING (Save the best model)
+        # Step the scheduler (watches validation loss)
+        scheduler.step(avg_val_loss)
+
+        # ---- MODEL CHECKPOINTING ----
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            patience_counter = 0
             torch.save(model.state_dict(), model_save_path)
-            # Save configuration so FastAPI knows how to rebuild the model later
             with open(config_save_path, "w") as f:
                 json.dump({"input_dim": input_dim, "num_classes": num_classes}, f)
-            print(f"   -> Validation loss improved! Saved model to {model_save_path}")
+            print(f"   -> Best model saved! (Val Loss: {best_val_loss:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"\n[EARLY STOPPING] No improvement for {patience} consecutive epochs.")
+                print(f"[EARLY STOPPING] Best Val Loss: {best_val_loss:.4f}")
+                break
 
-    print("\n[SUCCESS] Training Complete.")
+    print(f"\n{'='*60}")
+    print(f"  Training Complete!")
+    print(f"  Best Validation Loss: {best_val_loss:.4f}")
+    print(f"  Model saved to: {model_save_path}")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     train_model()
