@@ -74,15 +74,26 @@ def evaluate_pytorch_model():
         probs = torch.softmax(logits, dim=1)
         preds = torch.argmax(probs, dim=1).cpu().numpy()
 
-    # 5. Calculate Metrics
+    # 5. Calculate Multi-Class Metrics
     acc = accuracy_score(y_test, preds)
     p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(y_test, preds, average='macro', zero_division=0)
     p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(y_test, preds, average='weighted', zero_division=0)
 
+    # Calculate Binary Metrics (Normal vs Cyber Threat)
+    # Find index of "Normal" class
+    normal_idx = class_names.index("Normal") if "Normal" in class_names else 6
+    y_test_binary = (y_test != normal_idx).astype(int)
+    preds_binary = (preds != normal_idx).astype(int)
+    
+    bin_acc = accuracy_score(y_test_binary, preds_binary)
+    bin_p, bin_r, bin_f1, _ = precision_recall_fscore_support(y_test_binary, preds_binary, average='binary', zero_division=0)
+
     print(f"\n--- PyTorch Neural Network Test Results ---")
-    print(f"Accuracy:          {acc:.4f} ({acc*100:.2f}%)")
-    print(f"Macro F1-Score:    {f1_macro:.4f}")
-    print(f"Weighted F1-Score: {f1_weighted:.4f}")
+    print(f"| Task                      | Accuracy | Precision | Recall | F1-Score |")
+    print(f"|---------------------------|----------|-----------|--------|----------|")
+    print(f"| Binary Threat Detection    | {bin_acc*100:.2f}%   | {bin_p*100:.2f}%    | {bin_r*100:.2f}% | {bin_f1*100:.2f}%   |")
+    print(f"| 10-Class Threat Categorization | {acc*100:.2f}%   | {p_weighted*100:.2f}%    | {r_weighted*100:.2f}% | {f1_weighted*100:.2f}%   |")
+    print(f"\nMacro F1-Score:    {f1_macro:.4f}")
     print(f"Macro Recall:      {r_macro:.4f}")
     
     print("\nDetailed Per-Class Classification Report:")

@@ -40,30 +40,25 @@ def load_data():
 
 def compute_class_weights(y_train, num_classes, device):
     """
-    WHAT THIS DOES:
-    Calculates inverse-frequency weights for each class.
+    Smoothed Square-Root Class Weighting:
+    Formula: weight_i = sqrt( total_samples / (num_classes * count_of_class_i) )
     
-    WHY WE NEED IT:
-    Our dataset is extremely imbalanced:
-      - "Normal" traffic:  ~37,000 samples
-      - "Worms" attack:    ~44 samples (840x fewer!)
-    
-    Without class weights, the model learns to always predict "Normal" because
-    that minimizes overall loss. With class weights, we tell PyTorch:
-    "Getting a Worm wrong is 840x more costly than getting Normal wrong."
-    
-    FORMULA: weight_i = total_samples / (num_classes * count_of_class_i)
+    WHY?
+    Raw inverse weighting (135x for Worms) is too aggressive and ruins Normal precision.
+    Square-root smoothing scales the penalty down (135x -> 11.6x), balancing total
+    accuracy AND minority attack recall!
     """
     class_counts = Counter(y_train)
     total = len(y_train)
     weights = []
     for i in range(num_classes):
         count = class_counts.get(i, 1)
-        w = total / (num_classes * count)
-        weights.append(w)
+        raw_w = total / (num_classes * count)
+        smoothed_w = np.sqrt(raw_w) # Square root smoothing
+        weights.append(smoothed_w)
     
     weights_tensor = torch.tensor(weights, dtype=torch.float32).to(device)
-    print(f"[INFO] Class weights: {[f'{w:.2f}' for w in weights]}")
+    print(f"[INFO] Smoothed Class Weights: {[f'{w:.2f}' for w in weights]}")
     return weights_tensor
 
 def train_model():
@@ -114,7 +109,7 @@ def train_model():
     # If it hasn't improved for 'patience' epochs, it reduces lr by factor 0.5.
     # This lets the model make big jumps early and fine-tune later.
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        optimizer, mode='min', factor=0.5, patience=3
     )
 
     # 6. TRAINING LOOP WITH EARLY STOPPING
